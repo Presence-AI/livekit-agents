@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import AsyncIterable, Literal, Union, cast, overload
@@ -11,9 +12,10 @@ from urllib.parse import urlencode
 import aiohttp
 from livekit import rtc
 from livekit.agents import llm, utils
-from livekit.agents.llm import _oai_api
+from livekit.agents.metrics import MultimodalLLMError, MultimodalLLMMetrics
 from typing_extensions import TypedDict
 
+from .._oai_api import build_oai_function_description, create_ai_function_info
 from . import api_proto, remote_items
 from .log import logger
 
@@ -33,6 +35,7 @@ EventTypes = Literal[
     "response_done",
     "function_calls_collected",
     "function_calls_finished",
+    "metrics_collected",
 ]
 
 
@@ -66,6 +69,10 @@ class RealtimeResponse:
     """usage of the response"""
     done_fut: asyncio.Future[None]
     """future that will be set when the response is completed"""
+    _created_timestamp: float
+    """timestamp when the response was created"""
+    _first_token_timestamp: float | None = None
+    """timestamp when the first token was received"""
 
 
 @dataclass
@@ -695,6 +702,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         super().__init__()
+        self._label = f"{type(self).__module__}.{type(self).__name__}"
         self._main_atask = asyncio.create_task(
             self._main_task(), name="openai-realtime-session"
         )
@@ -791,9 +799,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             for fnc in self._fnc_ctx.ai_functions.values():
                 # the realtime API is using internally-tagged polymorphism.
                 # build_oai_function_description was built for the ChatCompletion API
-                function_data = llm._oai_api.build_oai_function_description(fnc)[
-                    "function"
-                ]
+                function_data = build_oai_function_description(fnc)["function"]
                 function_data["type"] = "function"
                 tools.append(function_data)
 
@@ -865,24 +871,8 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         if changes.to_add and not any(
             isinstance(msg.content, llm.ChatAudio) for _, msg in changes.to_add
         ):
-            # Patch: add an empty audio message to the chat context
-            # to set the API in audio mode
-            data = b"\x00\x00" * api_proto.SAMPLE_RATE
-            _empty_audio = rtc.AudioFrame(
-                data=data,
-                sample_rate=api_proto.SAMPLE_RATE,
-                num_channels=api_proto.NUM_CHANNELS,
-                samples_per_channel=len(data) // 2,
-            )
-            changes.to_add.append(
-                (
-                    None,
-                    llm.ChatMessage(
-                        role="user", content=llm.ChatAudio(frame=_empty_audio)
-                    ),
-                )
-            )
-            logger.debug("added empty audio message to the chat context")
+            # Patch: append an empty audio message to set the API in audio mode
+            changes.to_add.append((None, self._create_empty_user_audio_message(1.0)))
 
         _futs = [
             self.conversation.item.delete(item_id=msg.id) for msg in changes.to_delete
@@ -893,6 +883,34 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
 
         # wait for all the futures to complete
         await asyncio.gather(*_futs)
+
+    def _create_empty_user_audio_message(self, duration: float) -> llm.ChatMessage:
+        """Create an empty audio message with the given duration."""
+        samples = int(duration * api_proto.SAMPLE_RATE)
+        return llm.ChatMessage(
+            role="user",
+            content=llm.ChatAudio(
+                frame=rtc.AudioFrame(
+                    data=b"\x00\x00" * (samples * api_proto.NUM_CHANNELS),
+                    sample_rate=api_proto.SAMPLE_RATE,
+                    num_channels=api_proto.NUM_CHANNELS,
+                    samples_per_channel=samples,
+                )
+            ),
+        )
+
+    def _recover_from_text_response(self, item_id: str | None = None) -> None:
+        """Try to recover from a text response to audio mode.
+
+        Sometimes the OpenAI Realtime API returns text instead of audio responses.
+        This method tries to recover from this by requesting a new response after
+        deleting the text response and creating an empty user audio message.
+        """
+        if item_id:
+            # remove the text response if needed
+            self.conversation.item.delete(item_id=item_id)
+        self.conversation.item.create(self._create_empty_user_audio_message(1.0))
+        self.response.create()
 
     def _update_converstation_item_content(
         self, item_id: str, content: llm.ChatContent | list[llm.ChatContent] | None
@@ -1023,6 +1041,8 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                         self._handle_response_audio_transcript_delta(data)
                     elif event == "response.audio.done":
                         self._handle_response_audio_done(data)
+                    elif event == "response.text.done":
+                        self._handle_response_text_done(data)
                     elif event == "response.audio_transcript.done":
                         self._handle_response_audio_transcript_done(data)
                     elif event == "response.content_part.done":
@@ -1203,6 +1223,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             output=[],
             usage=response.get("usage"),
             done_fut=done_fut,
+            _created_timestamp=time.time(),
         )
         self._pending_responses[new_response.id] = new_response
         self.emit("response_created", new_response)
@@ -1257,6 +1278,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             content_type=content_type,
         )
         output.content.append(new_content)
+        response._first_token_timestamp = time.time()
         self.emit("response_content_added", new_content)
 
     def _handle_response_audio_delta(
@@ -1293,6 +1315,12 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         assert isinstance(content.audio_stream, utils.aio.Chan)
         content.audio_stream.close()
 
+    def _handle_response_text_done(
+        self, response_text_done: api_proto.ServerEvent.ResponseTextDone
+    ):
+        content = self._get_content(response_text_done)
+        content.text = response_text_done["text"]
+
     def _handle_response_audio_transcript_done(
         self,
         response_audio_transcript_done: api_proto.ServerEvent.ResponseAudioTranscriptDone,
@@ -1327,7 +1355,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             item = response_output_done["item"]
             assert item["type"] == "function_call"
 
-            fnc_call_info = _oai_api.create_ai_function_info(
+            fnc_call_info = create_ai_function_info(
                 self._fnc_ctx,
                 item["call_id"],
                 item["name"],
@@ -1361,15 +1389,19 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         response.status_details = response_data.get("status_details")
         response.usage = response_data.get("usage")
 
+        metrics_error = None
+        cancelled = False
         if response.status == "failed":
             assert response.status_details is not None
 
-            error = response.status_details.get("error")
-            code: str | None = None
-            message: str | None = None
-            if error is not None:
-                code = error.get("code")  # type: ignore
-                message = error.get("message")  # type: ignore
+            error = response.status_details.get("error", {})
+            code: str | None = error.get("code")  # type: ignore
+            message: str | None = error.get("message")  # type: ignore
+            metrics_error = MultimodalLLMError(
+                type=response.status_details.get("type"),
+                code=code,
+                message=message,
+            )
 
             logger.error(
                 "response generation failed",
@@ -1379,12 +1411,56 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             assert response.status_details is not None
             reason = response.status_details.get("reason")
 
+            metrics_error = MultimodalLLMError(
+                type=response.status_details.get("type"),
+                reason=reason,  # type: ignore
+            )
+
             logger.warning(
                 "response generation incomplete",
                 extra={"reason": reason, **self.logging_extra()},
             )
+        elif response.status == "cancelled":
+            cancelled = True
 
         self.emit("response_done", response)
+
+        # calculate metrics
+        ttft = -1.0
+        if response._first_token_timestamp is not None:
+            ttft = response._first_token_timestamp - response._created_timestamp
+        duration = time.time() - response._created_timestamp
+
+        usage = response.usage or {}  # type: ignore
+        metrics = MultimodalLLMMetrics(
+            timestamp=response._created_timestamp,
+            request_id=response.id,
+            ttft=ttft,
+            duration=duration,
+            cancelled=cancelled,
+            label=self._label,
+            completion_tokens=usage.get("output_tokens", 0),
+            prompt_tokens=usage.get("input_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            tokens_per_second=usage.get("output_tokens", 0) / duration,
+            error=metrics_error,
+            input_token_details=MultimodalLLMMetrics.InputTokenDetails(
+                cached_tokens=usage.get("input_token_details", {}).get(
+                    "cached_tokens", 0
+                ),
+                text_tokens=usage.get("input_token_details", {}).get("text_tokens", 0),
+                audio_tokens=usage.get("input_token_details", {}).get(
+                    "audio_tokens", 0
+                ),
+            ),
+            output_token_details=MultimodalLLMMetrics.OutputTokenDetails(
+                text_tokens=usage.get("output_token_details", {}).get("text_tokens", 0),
+                audio_tokens=usage.get("output_token_details", {}).get(
+                    "audio_tokens", 0
+                ),
+            ),
+        )
+        self.emit("metrics_collected", metrics)
 
     def _get_content(self, ptr: _ContentPtr) -> RealtimeContent:
         response = self._pending_responses[ptr["response_id"]]
